@@ -1,7 +1,9 @@
 from web3 import Web3
 from web3.auto import w3
 from web3.middleware import geth_poa_middleware
+from uniswap import Uniswap
 
+import requests
 import traceback
 import sys
 from functools import lru_cache
@@ -12,6 +14,11 @@ from web3.exceptions import MismatchedABI, LogTopicError
 from web3.types import ABIEvent
 from eth_utils import event_abi_to_log_topic, to_hex
 from hexbytes import HexBytes
+
+import aiohttp
+import asyncio
+import re
+from bs4 import BeautifulSoup
 
 import json
 import re
@@ -29,12 +36,26 @@ pair_abi = '[{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":
 
 accepted_functions = ['swapExactTokensForETHSupportingFeeOnTransferTokens', 'swapExactETHForTokensSupportingFeeOnTransferTokens', 'swapExactETHForTokens', 'swapExactTokensForETH', 'swapExactTokensForTokens']
 
+dai_contract = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+
+api_key_ethplorer = "freekey"
+
+address_uniswap = None                 # or None if you're not going to make transactions
+private_key = None             # or None if you're not going to make transactions
+version = 2                    # specify which version of Uniswap to use
+provider = 'https://eth.llamarpc.com'    # can also be set through the environment variable `PROVIDER`
+uniswap = Uniswap(address=address_uniswap, private_key=private_key, version=version, provider=provider)
+
 # Inicializar a instância do Web3
-w3 = Web3(Web3.HTTPProvider('https://eth.llamarpc.com'))
+w3 = Web3(Web3.HTTPProvider(provider))
 w3.middleware_onion.inject(geth_poa_middleware, layer=0)  # Apenas se estiver usando um nó Parity Ethereum
 
 # Criar objeto do contrato
 contract = w3.eth.contract(address=Web3.to_checksum_address(contract_address), abi=contract_abi)
+
+first_ocorrence = False
+amountIn = 0
+amountOut = 0
 
 @lru_cache(maxsize=None)
 def _get_topic2abi(abi):
@@ -77,9 +98,6 @@ def decode_list(l):
   return output
 
 def convert_to_hex(arg, target_schema):
-    """
-    utility function to convert byte codes into human readable and json serializable data structures
-    """
     output = dict()
     for k in arg:
         if isinstance(arg[k], (bytes, bytearray)):
@@ -100,10 +118,6 @@ def convert_to_hex(arg, target_schema):
 
 @lru_cache(maxsize=None)
 def _get_contract(address, abi):
-  """
-  This helps speed up execution of decoding across a large dataset by caching the contract object
-  It assumes that we are decoding a small set, on the order of thousands, of target smart contracts
-  """
   if isinstance(abi, (str)):
     abi = json.loads(abi)
 
@@ -130,13 +144,13 @@ def decode_log(data, topics, abi):
     topic2abi = _get_topic2abi(abi)
 
     log = {
-      'address': None, #Web3.toChecksumAddress(address),
-      'blockHash': None, #HexBytes(blockHash),
+      'address': None,
+      'blockHash': None,
       'blockNumber': None,
       'data': data, 
       'logIndex': None,
       'topics': [_get_hex_topic(_) for _ in topics],
-      'transactionHash': None, #HexBytes(transactionHash),
+      'transactionHash': None,
       'transactionIndex': None
     }
     event_abi = topic2abi[log['topics'][0]]
@@ -150,7 +164,174 @@ def decode_log(data, topics, abi):
   else:
     return ('no matching abi', None, None)
 
+def write_csv(archive_name, data, fieldnames, folder):
+    output_folder = "output"
+    folder_path = os.path.join(output_folder, folder)
+    file_path = os.path.join(output_folder, folder, archive_name)
+    file_exists = os.path.isfile(file_path)
+    os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(folder_path, exist_ok=True)  # Criar a pasta "output" se ainda não existir
 
+    with open(file_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(data)
+
+def getTokenSymbol(token_address):
+    # Obter o contrato do token a partir do endereço
+    token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=pair_abi)
+
+    # Obter o símbolo do token chamando o método correspondente no contrato
+    symbol = token_contract.functions.symbol().call()
+
+    symbol = symbol.replace(" ", "_")
+
+    return symbol
+
+def decode_transfer_event(transfer):
+    data_transfer_swap = transfer["data"].hex()
+    decoded_data = decode_log(
+        data_transfer_swap,
+        [
+            '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822',
+            '0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d',
+            '0x000000000000000000000000242301fa62f0de9e3842a5fb4c0cdca67e3a2fab'
+        ],
+        pair_abi
+    )
+    decoded_data_json = json.loads(decoded_data[1])
+    return decoded_data_json
+
+def process_transfer(transfer, index):
+    global first_ocorrence, amountIn, amountOut
+
+    transfer_signature = transfer["topics"][0].hex()
+    if transfer_signature == '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822':
+        if not first_ocorrence:
+            decoded_data_json  = decode_transfer_event(transfer)
+            print(json.dumps(decoded_data_json, indent=2))
+            amountIn = decoded_data_json["amount1In"] if decoded_data_json["amount0In"] == 0 else decoded_data_json["amount0In"]
+            first_ocorrence = True
+        if index == len(token_transfers) - 1 or index == len(token_transfers) - 2:
+            decoded_data_json  = decode_transfer_event(transfer)
+            print(json.dumps(decoded_data_json, indent=2))
+            amountOut = decoded_data_json["amount1Out"] if decoded_data_json["amount0Out"] == 0 else decoded_data_json["amount0Out"]
+
+def get_holders_api(fromTokenAddress, toTokenAddress):
+    holderUrlFrom = f"https://api.ethplorer.io/getTokenInfo/{fromTokenAddress}?apiKey={api_key_ethplorer}"
+    holderUrlTo = f"https://api.ethplorer.io/getTokenInfo/{toTokenAddress}?apiKey={api_key_ethplorer}"
+
+    try:
+        responseFrom = requests.get(holderUrlFrom)
+        responseTo = requests.get(holderUrlTo)
+        dataFrom = responseFrom.json()
+        dataTo = responseTo.json()
+        if 'holdersCount' in dataFrom:
+            holders_count_from = dataFrom['holdersCount']
+        if 'holdersCount' in dataTo:
+            holders_count_to = dataTo['holdersCount']
+    except:
+        pass
+    return holders_count_from, holders_count_to
+
+def get_prices(fromTokenAddress, toTokenAddress):
+    desired_output_amount = 1
+    from_dai_needed = 'NaN'
+    to_dai_needed = 'NaN'
+    try:
+       from_token_contract = w3.eth.contract(address=Web3.to_checksum_address(fromTokenAddress), abi=pair_abi)
+       from_decimals = from_token_contract.functions.decimals().call()
+       from_token_amount = desired_output_amount * 10**from_decimals
+       from_dai_needed = uniswap.get_price_input(Web3.to_checksum_address(fromTokenAddress), dai_contract, from_token_amount)
+       from_dai_needed = from_dai_needed/10**18
+    except:
+       pass
+
+    try:
+        to_token_contract = w3.eth.contract(address=Web3.to_checksum_address(toTokenAddress), abi=pair_abi)
+        to_decimals = to_token_contract.functions.decimals().call()
+        to_token_amount = desired_output_amount * 10**to_decimals
+        to_dai_needed = uniswap.get_price_input(Web3.to_checksum_address(toTokenAddress), dai_contract, to_token_amount)
+        to_dai_needed = to_dai_needed/10**18
+    except:
+        pass
+    return from_dai_needed, to_dai_needed
+
+async def fetch(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+async def get_holders_web_scrapping(fromTokenAddress, toTokenAddress):
+    # Endereço da página do token no Etherscan
+    from_token_page_url = f'https://etherscan.io/token/{fromTokenAddress}'
+    to_token_page_url = f'https://etherscan.io/token/{toTokenAddress}'
+
+    from_holders_count = 'NaN'
+    to_holders_count = 'NaN'
+
+    try:
+        # Fazendo a requisição GET à página
+        html = await fetch(from_token_page_url)
+
+        # Parse do conteúdo HTML
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Encontrar a div que contém as informações de holders
+        holders_div = soup.find('div', id='ContentPlaceHolder1_tr_tokenHolders')
+
+        if holders_div:
+            # Encontrar a div com a classe 'd-flex flex-wrap gap-2'
+            holders_info_div = holders_div.find('div', class_='d-flex flex-wrap gap-2')
+
+            if holders_info_div:
+                # Obter o texto da div
+                holders_text = holders_info_div.get_text(strip=True)
+
+                # Remover qualquer texto adicional e vírgulas
+                from_holders_count = re.sub(r'\(.*\)', '', holders_text).replace(',', '')
+
+                print(f"O número atual de holders do token é: {from_holders_count.strip()}")
+            else:
+                print("Div com a classe 'd-flex flex-wrap gap-2' não encontrada dentro da div de holders")
+        else:
+            print("Div de holders não encontrada no HTML da página")
+
+    except Exception as e:
+        print(f"Erro durante a requisição: {str(e)}")
+
+    try:
+        # Fazendo a requisição GET à página
+        html = await fetch(to_token_page_url)
+
+        # Parse do conteúdo HTML
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Encontrar a div que contém as informações de holders
+        holders_div = soup.find('div', id='ContentPlaceHolder1_tr_tokenHolders')
+
+        if holders_div:
+            # Encontrar a div com a classe 'd-flex flex-wrap gap-2'
+            holders_info_div = holders_div.find('div', class_='d-flex flex-wrap gap-2')
+
+            if holders_info_div:
+                # Obter o texto da div
+                holders_text = holders_info_div.get_text(strip=True)
+
+                # Remover qualquer texto adicional e vírgulas
+                to_holders_count = re.sub(r'\(.*\)', '', holders_text).replace(',', '')
+
+                print(f"O número atual de holders do token é: {to_holders_count.strip()}")
+            else:
+                print("Div com a classe 'd-flex flex-wrap gap-2' não encontrada dentro da div de holders")
+        else:
+            print("Div de holders não encontrada no HTML da página")
+
+    except Exception as e:
+        print(f"Erro durante a requisição: {str(e)}")
+
+    return from_holders_count, to_holders_count
 
 # Último bloco processado
 last_block = w3.eth.block_number
@@ -170,44 +351,40 @@ while True:
             # Obtendo informações do bloco mais recente
             block_data = {
                 "Block_ID": block.number,  # Identificador único do bloco
-                "Número_Bloco": block.number,
-                "Hash_Bloco": block.hash.hex(),
-                "Timestamp_Bloco": block.timestamp,
-                "Número_Transações": len(block.transactions)
+                "Hash_Block": block.hash.hex(),
+                "Miner": block.miner,
+                "Difficulty": block.difficulty,
+                "Total_Difficulty": block.totalDifficulty,
+                "Size": block.size,
+                "Gas_Limit": block.gasLimit,
+                "Gas_Used": block.gasUsed,
+                "Timestamp_Block": block.timestamp,
+                "Number_Transactions": len(block.transactions)
             }
 
-            block_filename = f"block_{block_number}.csv"
-            block_fieldnames = list(block_data.keys())
-            file_exists = os.path.isfile(block_filename)
+            write_csv(f"block_{block_number}.csv", block_data, block_data.keys(), 'block')
 
-            with open(block_filename, 'a', newline='') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=block_fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(block_data)
-
-            file_name_swap = f"swap_{block_number}_transactions.csv"
 
             # Iterar sobre as transações do bloco
             for tx_hash in block['transactions']:
                 tx = w3.eth.get_transaction(tx_hash)
-
+                receipt = w3.eth.get_transaction_receipt(tx_hash)
                 tx_data = {
                     "Block_ID": block.number,  # Chave estrangeira referenciando o bloco
-                    "Hash_Transação": tx.hash.hex(),
-                    "Remetente": tx["from"],
-                    "Destinatário": tx["to"],
-                    "Valor_(Wei)": tx.value,
-                    "Taxa_Gás": tx.gasPrice,
-                    "Limite_Gás": tx.gas,
-                    "Status": "Confirmada" if tx.blockNumber is not None else "Pendente",
-                    "Timestamp_Transação": w3.eth.get_block(tx.blockNumber).timestamp
+                    "Hash_Transaction": tx.hash.hex(),
+                    "From": tx["from"],
+                    "To": tx["to"],
+                    "Value_(Wei)": tx.value,
+                    "Gas_Price": tx.gasPrice,
+                    "Gas_Limit": tx.gas,
+                    "Gas_Used": receipt.gasUsed,
+                    "Status": "Confirmed" if tx.blockNumber is not None else "Pending",
+                    "Timestamp_Transaction": block.timestamp #w3.eth.get_block(tx.blockNumber).timestamp
                 }
 
                 # Verificar se a transação é para o contrato da rota V2 da Uniswap
                 if tx['to'] == Web3.to_checksum_address(contract_address):
 
-                    receipt = w3.eth.get_transaction_receipt(tx_hash)
                     token_transfers = receipt.get("logs", [])
 
                     first_ocorrence = False
@@ -218,74 +395,59 @@ while True:
 
                     if receipt.status != 0:
                         for index, transfer in enumerate(token_transfers):
-                            transfer_signature = transfer["topics"][0].hex()
-                            if(transfer_signature == '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822'):
-                                if not first_ocorrence:
-                                    data_transfer_swap = transfer["data"].hex()
-                                    data_transfer_swap_decoded = decode_log(
-                                    data_transfer_swap,
-                                    [
-                                    '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822',
-                                    '0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d',
-                                    '0x000000000000000000000000242301fa62f0de9e3842a5fb4c0cdca67e3a2fab'],
-                                    pair_abi)
-                                    print(json.dumps(json.loads(data_transfer_swap_decoded[1]), indent=2))
-                                    data_transfer_swap_decoded = json.loads(data_transfer_swap_decoded[1]) 
-                                    first_ocorrence = True
-                                    amountIn = data_transfer_swap_decoded["amount1In"] if data_transfer_swap_decoded["amount0In"] == 0 else data_transfer_swap_decoded["amount0In"]
-                                if index == len(token_transfers) - 1 or index == len(token_transfers) - 2:
-                                    data_transfer_swap = transfer["data"].hex()
-                                    data_transfer_swap_decoded = decode_log(
-                                    data_transfer_swap,
-                                    [
-                                    '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822',
-                                    '0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d',
-                                    '0x000000000000000000000000242301fa62f0de9e3842a5fb4c0cdca67e3a2fab'],
-                                    pair_abi)
-                                    print(json.dumps(json.loads(data_transfer_swap_decoded[1]), indent=2))
-                                    data_transfer_swap_decoded = json.loads(data_transfer_swap_decoded[1])
-                                    amountOut = data_transfer_swap_decoded["amount1Out"] if data_transfer_swap_decoded["amount0Out"] == 0 else data_transfer_swap_decoded["amount0Out"]
-                        # Decodificar o input da transação
+                            process_transfer(transfer, index)
 
                         decoded = decode_tx(tx['to'], tx['input'], contract_abi)
                         print("A Transação é de:", decoded[0])
                         print('Input decodificado:', decoded[1])
                         if decoded[0] in accepted_functions:
-
                             decoded_1 = json.loads(decoded[1])  # Convertendo a string em um dicionário
+
+                            fromTokenAddress = decoded_1.get('path', [])[0]
+                            toTokenAddress = decoded_1.get('path', [])[-1]
+
+                            holders_count_from = 'NaN'
+                            holders_count_to = 'NaN'
+
+                            loop = asyncio.get_event_loop()
+                            holders_count_from, holders_count_to =  loop.run_until_complete(get_holders_web_scrapping(fromTokenAddress, toTokenAddress))       
+
+                            from_dai_needed = 0
+                            to_dai_needed = 0
+
+                            from_dai_needed, to_dai_needed = get_prices(fromTokenAddress, toTokenAddress)
+
+                            from_token_symbol = "NaN"
+                            to_token_symbol = "NaN"
+                            try:
+                                from_token_symbol = getTokenSymbol(fromTokenAddress)
+                                to_token_symbol = getTokenSymbol(toTokenAddress)
+                            except:
+                                pass
 
                             swap_data = {
                                 "Block_ID": block_number,  # Identificador único do bloco
-                                "type_Transaction": decoded[0],
-                                "amountOutMin": decoded_1.get("amountOutMin"),
-                                "amountOut": amountOut,
-                                "amountIn": amountIn,
-                                "fromTokenContract": decoded_1.get("path", [])[0],
-                                "toTokenContract": decoded_1.get("path", [])[-1],
-                                "hashTransaction": tx_hash.hex(),
+                                "Type_Transaction": decoded[0],
+                                "Amount_Out_Min": decoded_1.get("amountOutMin"),
+                                "Amount_Out": amountOut,
+                                "Amount_In": amountIn,
+                                "From_Token_Address": fromTokenAddress,
+                                "To_Token_Address": toTokenAddress,
+                                "From_Token_Symbol": from_token_symbol,
+                                "To_Token_Symbol": to_token_symbol,
+                                "From_Token_Holders_Count": holders_count_from,
+                                "To_Token_Holders_Count": holders_count_to,
+                                "From_Token_Price": from_dai_needed,
+                                "To_Token_Price": to_dai_needed,
+                                "Hash_Transaction": tx_hash.hex(),
                             }
 
-                            swap_fieldnames = list(swap_data.keys())
-
-                            file_exists = os.path.isfile(file_name_swap)
-
-                            with open(file_name_swap, 'a', newline='') as csvfile:
-                                writer = csv.DictWriter(csvfile, fieldnames=swap_fieldnames)
-                                if not file_exists:
-                                    writer.writeheader()
-                                writer.writerow(swap_data)
+                            write_csv(f"swap_{block_number}_transactions.csv", swap_data, swap_data.keys(), 'swap')
                     else:
                         print("transacao cancelada")
 
-                transactions_filename = f"transactions_{block_number}.csv"
-                transactions_fieldnames = list(tx_data.keys())
-                file_exists = os.path.isfile(transactions_filename)
 
-                with open(transactions_filename, 'a', newline='') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=transactions_fieldnames)
-                    if not file_exists:
-                        writer.writeheader()
-                    writer.writerow(tx_data)
+                write_csv(f"transactions_{block_number}.csv", tx_data, list(tx_data.keys()), 'transaction')
 
         # Atualizar o último bloco processado
         last_block = current_block
