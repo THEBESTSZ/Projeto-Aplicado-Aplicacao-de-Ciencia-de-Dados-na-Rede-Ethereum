@@ -362,7 +362,7 @@ while True:
                 "Number_Transactions": len(block.transactions)
             }
 
-            write_csv(f"block_{block_number}.csv", block_data, block_data.keys(), 'block')
+            write_csv(f"block.csv", block_data, block_data.keys(), 'block')
 
 
             # Iterar sobre as transações do bloco
@@ -412,8 +412,8 @@ while True:
                             loop = asyncio.get_event_loop()
                             holders_count_from, holders_count_to =  loop.run_until_complete(get_holders_web_scrapping(fromTokenAddress, toTokenAddress))       
 
-                            from_dai_needed = 0
-                            to_dai_needed = 0
+                            from_dai_needed = "NaN"
+                            to_dai_needed = "NaN"
 
                             from_dai_needed, to_dai_needed = get_prices(fromTokenAddress, toTokenAddress)
 
@@ -442,12 +442,12 @@ while True:
                                 "Hash_Transaction": tx_hash.hex(),
                             }
 
-                            write_csv(f"swap_{block_number}_transactions.csv", swap_data, swap_data.keys(), 'swap')
+                            write_csv(f"swap_transactions.csv", swap_data, swap_data.keys(), 'swap')
                     else:
                         print("transacao cancelada")
 
 
-                write_csv(f"transactions_{block_number}.csv", tx_data, list(tx_data.keys()), 'transaction')
+                write_csv(f"transactions.csv", tx_data, list(tx_data.keys()), 'transaction')
 
         # Atualizar o último bloco processado
         last_block = current_block
